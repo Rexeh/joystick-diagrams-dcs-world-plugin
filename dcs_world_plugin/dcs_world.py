@@ -17,6 +17,8 @@ from joystick_diagrams.input.hat import Hat, HatDirection
 from joystick_diagrams.input.profile import Profile_
 from joystick_diagrams.input.profile_collection import ProfileCollection
 
+from .effective_bindings import EffectiveBindingsError, load_effective_bindings
+
 _logger = logging.getLogger(__name__)
 
 EASY_MODES = "_easy"
@@ -27,11 +29,15 @@ JOYSTICK_DIR = "joystick"
 
 GUID_POSITION_SLICE = slice(-46, -10)
 NAME_POSITION_SLICE = slice(-48)
+DEVICE_NAME_PATTERN = re.compile(r"^(?P<name>.*) \{(?P<guid>[^}]*)\}$")
+RELEASED_BUTTON_PATTERN = re.compile(r"^(?P<button>JOY_BTN\d+)_OFF$")
 
 
 class DCSWorldParser:
-    def __init__(self, path, easy_modes=True):
+    def __init__(self, path, easy_modes=True, install_dir=None, lua_interpreter=None):
         self.path = Path(path)
+        self.install_dir = Path(install_dir) if install_dir else None
+        self.lua_interpreter = lua_interpreter
         self.remove_easy_modes = easy_modes
         self.__easy_mode = EASY_MODES
         self.base_directory = self.__validate_base_directory()
@@ -108,10 +114,24 @@ class DCSWorldParser:
             )
         return self.valid_profiles
 
+    @staticmethod
+    def split_released_key(key: str) -> tuple[str, bool]:
+        """JOY_BTN17_OFF (the button released: a two-position switch back to its rest
+        position) -> ("JOY_BTN17", True); any other key -> (key, False)"""
+        match = RELEASED_BUTTON_PATTERN.match(key)
+        if match:
+            return match["button"], True
+        return key, False
+
+    @staticmethod
+    def command_label(command: str, released: bool) -> str:
+        return f"{command} (OFF)" if released else command
+
     def convert_button_format(
         self, button: str
     ) -> Axis | Hat | Button | AxisSlider | None:
         """Convert DCS Buttons to match expected "BUTTON_X" format"""
+        button = self.split_released_key(button)[0]
         split: list = button.split("_")
         _logger.debug(f"Converting button {button}")
         match len(split):
@@ -155,9 +175,30 @@ class DCSWorldParser:
             return collection
 
         _logger.info(f"Profiles to be processed {self.profiles_to_process}")
+        effective = self.load_effective_profiles(self.profiles_to_process)
         for profile in self.profiles_to_process:
             _logger.debug(f"Processing {profile=}")
             profile_object = collection.create_profile(profile_name=profile)
+            effective_profile = effective.get(profile, {})
+            if effective_profile.get("found"):
+                for device in effective_profile.get("devices", []):
+                    if "bindings" in device:
+                        self.process_effective_device(device, profile_object)
+                        continue
+                    _logger.warning(
+                        f"DCS: {profile} / {device.get('name')}: {device.get('error')}, "
+                        "only its .diff.lua changes are shown"
+                    )
+                    self.process_profile_device(
+                        Path(self.path, CONFIG_DIR, INPUT_DIR, profile, JOYSTICK_DIR)
+                        / f"{device.get('name')}.diff.lua",
+                        profile_object,
+                    )
+                continue
+            if effective:
+                _logger.warning(
+                    f"DCS: {profile} is not in the DCS install, only its .diff.lua changes are shown"
+                )
             self.fq_path = os.path.join(
                 self.path, CONFIG_DIR, INPUT_DIR, profile, JOYSTICK_DIR
             )
@@ -167,6 +208,79 @@ class DCSWorldParser:
                 self.process_profile_device(item, profile_object)
 
         return collection
+
+    def load_effective_profiles(self, profiles: list[str]) -> dict:
+        """Effective bindings per profile name, or {} to fall back to diff-only parsing."""
+        if not self.install_dir:
+            _logger.warning(
+                "DCS: no DCS install directory set, only the .diff.lua changes are shown "
+                "(module default bindings are missing)"
+            )
+            return {}
+        try:
+            result = load_effective_bindings(
+                self.install_dir, self.path, profiles, self.lua_interpreter
+            )
+        except EffectiveBindingsError as error:
+            _logger.warning(
+                f"DCS: effective bindings unavailable, only the .diff.lua changes are shown: {error}"
+            )
+            return {}
+        return result["profiles"]
+
+    def process_effective_device(self, device: dict, profile: Profile_):
+        """Adds a device and its effective bindings, as computed by the Lua loader"""
+        match = DEVICE_NAME_PATTERN.match(device.get("name", ""))
+        if not match:
+            _logger.error(f"DCS: device without a GUID: {device.get('name')}")
+            return
+        try:
+            Device_.validate_guid(match["guid"])
+        except ValueError as e:
+            _logger.error(e)
+            return
+
+        for unmatched in device.get("unmatched_diffs", []):
+            # no command of the defaults has this hash: DCS ignores it too (a command
+            # removed from the module), or an iCommand number was not learned
+            _logger.debug(
+                f"DCS: {device['name']}: diff entry without command {unmatched}"
+            )
+
+        bindings = []
+        for binding in device.get("bindings", []):
+            if not binding["key"].startswith("JOY_"):
+                # some module profiles carry keyboard keys in their joystick defaults
+                _logger.debug(f"DCS: {device['name']}: not a joystick input {binding}")
+                continue
+            bindings.append(
+                (binding["key"], binding.get("reformers") or [], binding.get("command"))
+            )
+
+        active_device = profile.add_device(match["guid"], match["name"])
+        self.add_commands(active_device, bindings)
+
+    def add_commands(self, device: Device_, bindings: list[tuple]):
+        """Adds (key, reformers, command) bindings to a device. DCS lets several commands
+        share an input (e.g. a switch pressed and released): they are joined with " / "
+        instead of the last one replacing the others."""
+        commands: dict[tuple[str, frozenset], list[str]] = {}
+        for dcs_key, reformers, dcs_command in bindings:
+            key, released = self.split_released_key(dcs_key)
+            names = commands.setdefault((key, frozenset(reformers)), [])
+            command = self.command_label(dcs_command or "", released)
+            if command not in names:
+                names.append(command)
+
+        for (key, reformers), names in commands.items():
+            input_identifier = self.convert_button_format(key)
+            if not input_identifier:
+                continue
+            command = " / ".join(names)
+            if reformers:
+                device.add_modifier_to_input(input_identifier, set(reformers), command)
+            else:
+                device.create_input(input_identifier, command)
 
     def process_profile_device(self, item: Path, profile: Profile_):
         _logger.debug(f"Processing {profile=} device {item=}")
@@ -211,6 +325,7 @@ class DCSWorldParser:
     def assign_to_inputs(self, config: dict, profile: Device_):
         search_keys = ["keyDiffs", "axisDiffs"]
 
+        bindings = []
         for key in search_keys:
             if key in config.keys():
                 for data in config[key].values():
@@ -218,30 +333,12 @@ class DCSWorldParser:
                     _logger.debug(f"Operation name is currently {operation=}")
                     if data.get("added"):
                         for binding in data["added"].values():
-                            input_identifier = self.convert_button_format(
-                                binding["key"]
+                            reform_set = self.reformers_to_set(
+                                binding.get("reformers") or {}
                             )
+                            bindings.append((binding["key"], reform_set, operation))
 
-                            if not input_identifier:
-                                continue
-
-                            # Create Reforms first
-                            if binding.get("reformers"):
-                                # Initialise base button if not exists
-
-                                reform_set = self.reformers_to_set(
-                                    binding.get("reformers")
-                                )
-
-                                _logger.debug(
-                                    f"Modifiers {reform_set=} and type is {type(reform_set)}"
-                                )
-
-                                profile.add_modifier_to_input(
-                                    input_identifier, reform_set, operation
-                                )
-                            else:
-                                profile.create_input(input_identifier, operation)
+        self.add_commands(profile, bindings)
 
     def reformers_to_set(self, reformers: dict) -> set:
         return {x for x in reformers.values()}
